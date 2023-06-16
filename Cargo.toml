@@ -9,9 +9,7 @@ license = "Unlicense"
 
 [dependencies]
 clap = { version = "4.0.32", features = ["derive"] }
-rlimit = "0.9.1"
 walkdir = "2"
-crossbeam-channel = "0.5"
 unicode-normalization = "0.1.22"
 
 [profile.release]
