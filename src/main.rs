@@ -1,10 +1,9 @@
+#![feature(round_char_boundary)]
 use std::path::PathBuf;
 
 use async_recursion::async_recursion;
 use clap::Parser;
-use rlimit::Resource;
 use tokio::{sync::Semaphore, time::Instant};
-use unicode_normalization::{is_nfc, UnicodeNormalization};
 
 const CONCURRENT_TASKS: usize = 32768;
 static SEMA: Semaphore = Semaphore::const_new(CONCURRENT_TASKS);
@@ -47,11 +46,6 @@ async fn main() {
     // Automatically increase NOFILE rlimit to the allowed maximum
     rlimit::increase_nofile_limit(u64::MAX).expect("failed during increasing NOFILE rlimit");
 
-    let nofile = rlimit::getrlimit(Resource::NOFILE).expect("cannot query rlimit");
-    if nofile.0 < 1024 || nofile.1 < 1024 {
-        eprintln!("warning: NOFILE resource limit is low(={nofile:?}), run `ulimit -n 65536` and try again if panic occurs");
-    }
-
     if args.follow_directory_symlinks {
         eprintln!("warning: --follow_directory_symlinks is ON; be aware for infinite recursion!");
     }
@@ -84,35 +78,39 @@ async fn normalize_paths(
         let _aq = SEMA.acquire();
         let task = tokio::task::spawn(async move {
             let mut cnt = 0;
-            let mut p = if let Some(p) = p.to_str().map(str::to_owned) {
+            let p = if let Some(p) = p.to_str().map(str::to_owned) {
                 p
             } else {
                 eprintln!("warning: {} is not a valid UTF-8 path", p.to_string_lossy());
                 return 0;
             };
+            let mut p = PathBuf::from(p);
 
-            if !is_nfc(&p) {
-                let newp = p.nfc().collect::<String>();
-                if !dry_run {
-                    match tokio::fs::rename(&p, &newp).await {
-                        Ok(()) => {
-                            if verbose {
-                                eprintln!("success: {p} -> {newp}");
-                            }
-                            cnt += 1;
+            if let Some(filename) = p.file_name() {
+                if filename.len() > 100 {
+                    let is_dir = p.is_dir();
+                    let is_file = p.is_file();
+                    if is_dir || is_file {
+                        let mut newp = p.clone();
+                        if is_dir {
+                            let filename = filename.to_str().unwrap();
+                            newp.set_file_name(&filename[..filename.floor_char_boundary(100)].trim());
+                        } else if is_file {
+                            let filestem = p.file_stem().unwrap().to_str().unwrap();
+                            let ext = p.extension().unwrap().to_str().unwrap();
+                            assert_eq!(ext, "txt");
+                            newp.set_file_name(format!("{}.txt", &filestem[..filestem.floor_char_boundary(96)].trim()));
                         }
-                        Err(e) => eprintln!("failure: {p} -> {newp}: {e}"),
+                        tokio::fs::rename(&p, &newp).await.expect("cannot rename file");
+                        eprintln!("success: {} -> {}", p.display(), newp.display());
+                        p = newp;
                     }
-                } else {
-                    eprintln!("skip: {p} -> {newp}");
                 }
-                p = newp;
             }
 
-            let p = PathBuf::from(p);
             if (!p.is_symlink() || follow_symlinks) && p.is_dir() {
                 let mut paths = Vec::new();
-                let mut dir = tokio::fs::read_dir(p).await.expect("cannot list directory");
+                let mut dir = tokio::fs::read_dir(p.clone()).await.expect(format!("cannot list directory: {}", p.display()).as_str());
                 while let Ok(Some(d)) = dir.next_entry().await {
                     paths.push(d.path());
                 }
